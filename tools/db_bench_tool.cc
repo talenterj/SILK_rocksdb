@@ -36,6 +36,7 @@
 #include <ratio>
 #include <chrono>
 #include <unistd.h>
+#include <string>
 
 #include "db/db_impl.h"
 #include "db/version_set.h"
@@ -958,6 +959,24 @@ DEFINE_bool(identity_as_first_hash, false, "the first hash function of cuckoo "
             "is 8 bytes");
 DEFINE_bool(dump_malloc_stats, true, "Dump malloc stats in LOG ");
 
+DEFINE_bool(sine_write_rate, false,
+            "Use a sine wave write_rate_limit");
+
+DEFINE_uint64(sine_write_rate_interval_milliseconds, 10000,
+              "Interval of which the sine wave write_rate_limit is recalculated");
+
+DEFINE_double(sine_a, 1,
+              "A in f(x) = A sin(bx + c) + d");
+
+DEFINE_double(sine_b, 1,
+              "B in f(x) = A sin(bx + c) + d");
+
+DEFINE_double(sine_c, 0,
+              "C in f(x) = A sin(bx + c) + d");
+
+DEFINE_double(sine_d, 1,
+              "D in f(x) = A sin(bx + c) + d");
+
 enum RepFactory {
   kSkipList,
   kPrefixHash,
@@ -1419,6 +1438,7 @@ class CombinedStats;
 class Stats {
  private:
   int id_;
+  uint64_t sine_interval_;
   uint64_t start_;
   uint64_t finish_;
   double seconds_;
@@ -1452,6 +1472,7 @@ class Stats {
     bytes_ = 0;
     seconds_ = 0;
     start_ = FLAGS_env->NowMicros();
+    sine_interval_ = FLAGS_env->NowMicros();
     finish_ = start_;
     last_report_finish_ = start_;
     message_.clear();
@@ -1524,6 +1545,18 @@ class Stats {
     }
   }
 
+  void ResetSineInterval() {
+        sine_interval_ = FLAGS_env->NowMicros();
+    }
+
+    uint64_t GetSineInterval() {
+        return sine_interval_;
+    }
+
+    uint64_t GetStart() {
+        return start_;
+    }
+
   void ResetLastOpTime() {
     // Set to now to avoid latency from calls to SleepForMicroseconds
     last_op_finish_ = FLAGS_env->NowMicros();
@@ -1579,10 +1612,14 @@ class Stats {
           next_report_ += FLAGS_stats_interval;
 
         } else {
+	  
+//       	std::string s = dbstats->ToString();
+  //        std::string s1 = s.substr(s.find("write.micros"), 105);//output write latency per sec
+    //      fprintf(stdout, "%s\n",s1.c_str());
 
           fprintf(stderr,
                   "%s ... thread %d: (%" PRIu64 ",%" PRIu64 ") ops and "
-                  "(%.1f,%.1f) ops/second in (%.6f,%.6f) seconds\n",
+                  "(%.1f,%.1f) ops/second in (%.6f,%.6f) seconds:)\n",
                   FLAGS_env->TimeToString(now/1000000).c_str(),
                   id_,
                   done_ - last_report_done_, done_,
@@ -1591,6 +1628,8 @@ class Stats {
                   done_ / ((now - start_) / 1000000.0),
                   (now - last_report_finish_) / 1000000.0,
                   (now - start_) / 1000000.0);
+
+	//    dbstats->Reset(); //esets all ticker and histogram stats
 
           cur_ops_interval = (done_ - last_report_done_) /
                   (usecs_since_last / 1000000.0);
@@ -1707,6 +1746,9 @@ class Stats {
           next_report_ += FLAGS_stats_interval;
 
         } else {
+          std::string s = dbstats->ToString();
+          std::string s1 = s.substr(s.find("write.micros"), 105);//output write latency per sec
+          fprintf(stdout, "STATISTICS:\n%s\n",s1.c_str());
 
           fprintf(stderr,
                   "%s ... thread %d: (%" PRIu64 ",%" PRIu64 ") ops and "
@@ -1719,7 +1761,7 @@ class Stats {
                   done_ / ((now - start_) / 1000000.0),
                   (now - last_report_finish_) / 1000000.0,
                   (now - start_) / 1000000.0);
-
+	 dbstats->Reset(); //resets all ticker and histogram stats
           for (auto it = hist_.begin(); it != hist_.end(); ++it) {
 
                 fprintf(stdout, "Microseconds per %s %d :\n%.200s\n",
@@ -2782,7 +2824,7 @@ void VerifyDBFromDB(std::string& truth_db_name) {
       }
     }
     if (FLAGS_statistics) {
-      fprintf(stdout, "STATISTICS:\n%s\n", dbstats->ToString().c_str());
+     // fprintf(stdout, "STATISTICS:\n%s\n", dbstats->ToString().c_str());
     }
     if (FLAGS_simcache_size >= 0) {
       fprintf(stdout, "SIMULATOR CACHE STATISTICS:\n%s\n",
@@ -3466,6 +3508,10 @@ void VerifyDBFromDB(std::string& truth_db_name) {
     }
     options.env = FLAGS_env;
 
+      if (FLAGS_sine_write_rate) {
+          FLAGS_benchmark_write_rate_limit = static_cast<uint64_t>(SineRate(0));
+      }
+
     if (FLAGS_num_multi_db <= 1) {
       OpenDb(options, FLAGS_db, &db_);
     } else {
@@ -3658,6 +3704,10 @@ void VerifyDBFromDB(std::string& truth_db_name) {
     }
   }
 
+  double SineRate(double x) {
+            return FLAGS_sine_a*sin((FLAGS_sine_b*x) + FLAGS_sine_c) + FLAGS_sine_d;
+        }
+
   void DoWrite(ThreadState* thread, WriteMode write_mode) {
     const int test_duration = write_mode == RANDOM ? FLAGS_duration : 0;
     const int64_t num_ops = writes_ == 0 ? num_ : writes_;
@@ -3805,6 +3855,27 @@ void VerifyDBFromDB(std::string& truth_db_name) {
       }
       thread->stats.FinishedOps(db_with_cfh, db_with_cfh->db,
                                 entries_per_batch_, kWrite);
+        if (FLAGS_sine_write_rate) {
+            uint64_t now = FLAGS_env->NowMicros();
+
+            uint64_t usecs_since_last;
+            if (now > thread->stats.GetSineInterval()) {
+                usecs_since_last = now - thread->stats.GetSineInterval();
+            } else {
+                usecs_since_last = 0;
+            }
+
+            if (usecs_since_last >
+                (FLAGS_sine_write_rate_interval_milliseconds * uint64_t{1000})) {
+                double usecs_since_start =
+                        static_cast<double>(now - thread->stats.GetStart());
+                thread->stats.ResetSineInterval();
+                uint64_t write_rate =
+                        static_cast<uint64_t>(SineRate(usecs_since_start / 1000000.0));
+                thread->shared->write_rate_limiter.reset(
+                        NewGenericRateLimiter(write_rate));
+            }
+        }
       if (!s.ok()) {
         fprintf(stderr, "put error: %s\n", s.ToString().c_str());
         exit(1);
